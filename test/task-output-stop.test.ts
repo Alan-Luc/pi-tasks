@@ -185,7 +185,7 @@ describe("TaskStop", () => {
     await launchAgentTask(mock);
     const res = await mock.executeTool("TaskStop", { task_id: "1" });
 
-    expect(res.content[0].text).toBe("Task #1 stopped successfully");
+    expect(res.content[0].text).toBe("Task #1 stopped");
     expect(rpc.stopped).toEqual(["agent-1"]);
     const get = await mock.executeTool("TaskGet", { taskId: "1" });
     expect(get.content[0].text).toContain("Status: completed");
@@ -198,7 +198,7 @@ describe("TaskStop", () => {
     await launchAgentTask(mock);
     const res = await mock.executeTool("TaskStop", { task_id: "agent-1" });
 
-    expect(res.content[0].text).toBe("Task #1 stopped successfully");
+    expect(res.content[0].text).toBe("Task #1 stopped");
     expect(rpc.stopped).toEqual(["agent-1"]);
     const get = await mock.executeTool("TaskGet", { taskId: "1" });
     expect(get.content[0].text).toContain("Status: completed");
@@ -208,7 +208,7 @@ describe("TaskStop", () => {
     await launchAgentTask(mock);
     const res = await mock.executeTool("TaskStop", { task_id: "agent-" });
 
-    expect(res.content[0].text).toBe("Task #1 stopped successfully");
+    expect(res.content[0].text).toBe("Task #1 stopped");
     expect(rpc.stopped).toEqual(["agent-1"]);
     const get = await mock.executeTool("TaskGet", { taskId: "1" });
     expect(get.content[0].text).toContain("Status: completed");
@@ -218,7 +218,7 @@ describe("TaskStop", () => {
     await launchAgentTask(mock);
     const res = await mock.executeTool("TaskStop", { shell_id: "1" });
 
-    expect(res.content[0].text).toBe("Task #1 stopped successfully");
+    expect(res.content[0].text).toBe("Task #1 stopped");
     expect(rpc.stopped).toEqual(["agent-1"]);
   });
 

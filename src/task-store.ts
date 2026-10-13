@@ -236,6 +236,7 @@ export class TaskStore {
         return { task: undefined, changedFields: ["deleted"], warnings: [] };
       }
 
+      const prevStatus = task.status;
       if (fields.status !== undefined) {
         task.status = fields.status;
         changedFields.push("status");
@@ -312,6 +313,17 @@ export class TaskStore {
           }
         }
         changedFields.push("blockedBy");
+      }
+
+      // Warn when manually moving a task into an active/done state while it still has
+      // open blockers — TaskExecute refuses this, but TaskUpdate is a manual override, so
+      // it is stored with a warning rather than blocked. Checked after edge edits so a
+      // combined status + addBlockedBy call sees the final blocker set.
+      if ((fields.status === "in_progress" || fields.status === "completed") && fields.status !== prevStatus) {
+        const open = task.blockedBy.filter(bid => this.tasks.get(bid)?.status !== "completed");
+        if (open.length > 0) {
+          warnings.push(`#${id} set to ${fields.status} with open blockers: ${open.map(b => "#" + b).join(", ")}`);
+        }
       }
 
       task.updatedAt = Date.now();

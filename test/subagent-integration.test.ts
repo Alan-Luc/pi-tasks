@@ -812,9 +812,14 @@ describe("RPC protocol correctness", () => {
     await vi.advanceTimersByTimeAsync(31000);
 
     const result = await execPromise;
-    expect(result.content[0].text).toContain("timeout");
-
+    // #48: a timeout is not proof the agent never started, so the task is NOT reverted
+    // to pending (which would invite a duplicate spawn) — it stays in_progress and the
+    // caller is told the outcome is unknown.
+    expect(result.content[0].text).toContain("spawn timed out");
     vi.useRealTimers();
+
+    const got = await mock.executeTool("TaskGet", { taskId: "1" });
+    expect(got.content[0].text).toContain("Status: in_progress");
   });
 
   it("ready broadcast sets subagentsAvailable even after init", async () => {
@@ -872,7 +877,7 @@ describe("RPC protocol correctness", () => {
     expect(rpc.spawned).toHaveLength(1);
 
     const result = await mock.executeTool("TaskStop", { task_id: "1" });
-    expect(result.content[0].text).toContain("stopped successfully");
+    expect(result.content[0].text).toContain("stopped");
     expect(rpc.stopped).toContain("agent-1");
 
     rpc.unsub();
@@ -894,9 +899,13 @@ describe("RPC protocol correctness", () => {
     // Clear spawned list so the mock's stop handler won't find the agent
     rpc.spawned.length = 0;
 
-    // TaskStop should still succeed (stopSubagent catches the error)
+    // TaskStop still resolves (stopSubagent reports the failure rather than throwing)
+    // and still marks the task completed, but the message no longer claims a confirmed
+    // stop — it says the stop was not confirmed.
     const result = await mock.executeTool("TaskStop", { task_id: "1" });
-    expect(result.content[0].text).toContain("stopped successfully");
+    expect(result.content[0].text).toContain("not confirmed");
+    const got = await mock.executeTool("TaskGet", { taskId: "1" });
+    expect(got.content[0].text).toContain("Status: completed");
 
     rpc.unsub();
   });
@@ -924,9 +933,9 @@ describe("RPC protocol correctness", () => {
     const stopPromise = mock.executeTool("TaskStop", { task_id: "1" });
     await vi.advanceTimersByTimeAsync(11000);
 
-    // Should resolve (not throw) — stopSubagent catches timeout
+    // Should resolve (not throw) — stopSubagent reports the timeout as unconfirmed
     const result = await stopPromise;
-    expect(result.content[0].text).toContain("stopped successfully");
+    expect(result.content[0].text).toContain("not confirmed");
 
     vi.useRealTimers();
   });
@@ -1200,5 +1209,152 @@ describe("Cascade data injection (buildTaskPrompt)", () => {
 
     const bPrompt = rpc.spawned[1].prompt;
     expect(bPrompt).not.toContain("Prerequisite task results");
+  });
+});
+
+/** Spawn mock that answers the first `immediate` spawns and holds the rest, so a test
+ *  can let the 30s timeout fire and deliver the reply late via `replyLate`. */
+function installDelayedSpawnMock(pi: { events: MockEventBus }, immediate = 0) {
+  const unsubPing = installVersionedMock(pi, 2);
+  const pending: string[] = [];
+  const stopped: string[] = [];
+  let count = 0;
+  const unsubSpawn = pi.events.on("subagents:rpc:spawn", (data: unknown) => {
+    const { requestId } = data as { requestId: string };
+    if (++count <= immediate) {
+      pi.events.emit(`subagents:rpc:spawn:reply:${requestId}`, { success: true, data: { id: `agent-${count}` } });
+    } else {
+      pending.push(requestId);
+    }
+  });
+  const unsubStop = pi.events.on("subagents:rpc:stop", (data: unknown) => {
+    const { requestId, agentId } = data as { requestId: string; agentId: string };
+    stopped.push(agentId);
+    pi.events.emit(`subagents:rpc:stop:reply:${requestId}`, { success: true });
+  });
+  return {
+    stopped,
+    replyLate(agentId: string) {
+      const requestId = pending.shift()!;
+      pi.events.emit(`subagents:rpc:spawn:reply:${requestId}`, { success: true, data: { id: agentId } });
+    },
+    unsub() { unsubPing.unsub(); unsubSpawn(); unsubStop(); },
+  };
+}
+
+describe("Late spawn reply after timeout (#48)", () => {
+  afterEach(() => { vi.useRealTimers(); });
+
+  async function executeAndTimeOut(mock: ReturnType<typeof mockPi>) {
+    vi.useFakeTimers();
+    const exec = mock.executeTool("TaskExecute", { task_ids: ["1"] });
+    await vi.advanceTimersByTimeAsync(31_000);
+    return exec;
+  }
+
+  it("links a late-replying agent so its completion settles the task", async () => {
+    const mock = mockPi();
+    const rpc = installDelayedSpawnMock(mock.pi);
+    initExtension(mock.pi as any);
+    await mock.executeTool("TaskCreate", { subject: "Slow", description: "d", agentType: "general-purpose" });
+
+    const result = await executeAndTimeOut(mock);
+    expect(result.content[0].text).toContain("spawn timed out");
+
+    rpc.replyLate("agent-late");
+    const got = await mock.executeTool("TaskGet", { taskId: "1" });
+    expect(got.content[0].text).toContain("Status: in_progress");
+    expect(got.content[0].text).toContain("agent-late");
+    expect(rpc.stopped).toEqual([]);
+
+    mock.pi.events.emit("subagents:completed", { id: "agent-late", result: "done" });
+    const after = await mock.executeTool("TaskGet", { taskId: "1" });
+    expect(after.content[0].text).toContain("Status: completed");
+    rpc.unsub();
+  });
+
+  it("stops a late-replying agent when the task was reset in the meantime", async () => {
+    const mock = mockPi();
+    const rpc = installDelayedSpawnMock(mock.pi);
+    initExtension(mock.pi as any);
+    await mock.executeTool("TaskCreate", { subject: "Slow", description: "d", agentType: "general-purpose" });
+
+    await executeAndTimeOut(mock);
+    await mock.executeTool("TaskUpdate", { taskId: "1", status: "pending" });
+
+    rpc.replyLate("agent-orphan");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(rpc.stopped).toEqual(["agent-orphan"]);
+    const got = await mock.executeTool("TaskGet", { taskId: "1" });
+    expect(got.content[0].text).toContain("Status: pending");
+    rpc.unsub();
+  });
+
+  it("ignores a reply arriving after the late-reply window", async () => {
+    const mock = mockPi();
+    const rpc = installDelayedSpawnMock(mock.pi);
+    initExtension(mock.pi as any);
+    await mock.executeTool("TaskCreate", { subject: "Slow", description: "d", agentType: "general-purpose" });
+
+    await executeAndTimeOut(mock);
+    await vi.advanceTimersByTimeAsync(5 * 60_000 + 1);
+
+    rpc.replyLate("agent-too-late");
+    const got = await mock.executeTool("TaskGet", { taskId: "1" });
+    expect(got.content[0].text).not.toContain("agent-too-late");
+    expect(rpc.stopped).toEqual([]);
+    rpc.unsub();
+  });
+
+  it("stops a late-replying agent after a session switch instead of linking a reused task ID", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-tasks-late-"));
+    delete process.env.PI_TASKS;
+    try {
+      const mock = mockPi();
+      const rpc = installDelayedSpawnMock(mock.pi);
+      initExtension(mock.pi as any);
+      await mock.fireLifecycle("session_start", { reason: "startup" }, mockSessionCtx("late-a", { cwd }));
+      await mock.executeTool("TaskCreate", { subject: "Slow", description: "d", agentType: "general-purpose" });
+      await executeAndTimeOut(mock);
+
+      // /new: the store moves to session B's file, where task IDs restart at 1.
+      await mock.fireLifecycle("session_start", { reason: "new" }, mockSessionCtx("late-b", { cwd }));
+      await mock.executeTool("TaskCreate", { subject: "Unrelated", description: "d" });
+      await mock.executeTool("TaskUpdate", { taskId: "1", status: "in_progress" });
+
+      rpc.replyLate("agent-stray");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(rpc.stopped).toEqual(["agent-stray"]);
+      const got = await mock.executeTool("TaskGet", { taskId: "1" });
+      expect(got.content[0].text).toContain("Unrelated");
+      expect(got.content[0].text).not.toContain("agent-stray");
+      rpc.unsub();
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a cascaded task in_progress on spawn timeout and links the late agent", async () => {
+    config.current = { autoCascade: true };
+    const mock = mockPi();
+    const rpc = installDelayedSpawnMock(mock.pi, 1);
+    initExtension(mock.pi as any);
+    await mock.fireLifecycle("turn_start", {}, mockCtx());
+    await mock.executeTool("TaskCreate", { subject: "A", description: "d", agentType: "general-purpose" });
+    await mock.executeTool("TaskCreate", { subject: "B", description: "d", agentType: "general-purpose" });
+    await mock.executeTool("TaskUpdate", { taskId: "2", addBlockedBy: ["1"] });
+    await mock.executeTool("TaskExecute", { task_ids: ["1"] });
+
+    vi.useFakeTimers();
+    mock.pi.events.emit("subagents:completed", { id: "agent-1", result: "ok" });
+    await vi.advanceTimersByTimeAsync(31_000);
+
+    const mid = await mock.executeTool("TaskGet", { taskId: "2" });
+    expect(mid.content[0].text).toContain("Status: in_progress");
+
+    rpc.replyLate("agent-late");
+    const got = await mock.executeTool("TaskGet", { taskId: "2" });
+    expect(got.content[0].text).toContain("agent-late");
+    rpc.unsub();
   });
 });

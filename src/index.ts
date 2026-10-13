@@ -69,6 +69,9 @@ function intervalFor(tasks: Task[]): number {
 /** How many turns completed tasks linger before auto-clearing. */
 const AUTO_CLEAR_DELAY = 4;
 
+/** How long a timed-out spawn keeps listening for a late reply before giving up. */
+const LATE_REPLY_WINDOW_MS = 5 * 60_000;
+
 /** Neutralize a task field for the echo: collapse newlines and strip reminder tags. */
 function sanitizeField(value: string): string {
   return value.replace(/[\r\n]+/g, " ").replace(/<\/?system-reminder>/gi, "").trim();
@@ -181,21 +184,35 @@ export default function (pi: ExtensionAPI) {
     | { success: true; data?: T }
     | { success: false; error: string };
 
-  /** Call a subagents RPC method: emit request, wait for scoped reply, unwrap envelope. */
-  function rpcCall<T>(channel: string, params: Record<string, unknown>, timeoutMs: number): Promise<T> {
+  /** Call a subagents RPC method: emit request, wait for scoped reply, unwrap envelope.
+   *  With `onLateReply`, a timeout still rejects, but a success reply arriving within
+   *  LATE_REPLY_WINDOW_MS afterwards is handed to it instead of being dropped. */
+  function rpcCall<T>(channel: string, params: Record<string, unknown>, timeoutMs: number, onLateReply?: (data: T) => void): Promise<T> {
     const requestId = randomUUID();
     debug(`rpc:send ${channel}`, { requestId });
     return new Promise<T>((resolve, reject) => {
+      let timedOut = false;
+      let lateTimer: ReturnType<typeof setTimeout> | undefined;
       const timer = setTimeout(() => {
-        unsub();
         debug(`rpc:timeout ${channel}`, { requestId });
-        reject(new Error(`${channel} timeout`));
+        if (onLateReply) {
+          timedOut = true;
+          // Only cleans up a listener — must not keep `pi -p` alive.
+          lateTimer = setTimeout(unsub, LATE_REPLY_WINDOW_MS).unref();
+        } else {
+          unsub();
+        }
+        const err = new Error(`${channel} timeout`) as Error & { timeout?: boolean };
+        err.timeout = true;
+        reject(err);
       }, timeoutMs);
       const unsub = pi.events.on(`${channel}:reply:${requestId}`, (raw: unknown) => {
-        unsub(); clearTimeout(timer);
-        debug(`rpc:reply ${channel}`, { requestId, raw });
+        unsub(); clearTimeout(timer); clearTimeout(lateTimer);
+        debug(`rpc:reply ${channel}`, { requestId, raw, late: timedOut });
         const reply = raw as RpcReply<T>;
-        if (reply.success) resolve(reply.data as T);
+        if (timedOut) {
+          if (reply.success) onLateReply?.(reply.data as T);
+        } else if (reply.success) resolve(reply.data as T);
         else reject(new Error(reply.error));
       });
       pi.events.emit(channel, { requestId, ...params });
@@ -204,15 +221,39 @@ export default function (pi: ExtensionAPI) {
   }
 
   /** Spawn a subagent via pi.events RPC (requires @tintinweb/pi-subagents extension). */
-  function spawnSubagent(type: string, prompt: string, options?: any): Promise<string> {
+  function spawnSubagent(type: string, prompt: string, options?: any, onLateSpawn?: (agentId: string) => void): Promise<string> {
     debug("spawn:call", { type, options: { ...options, prompt: undefined } });
-    return rpcCall<{ id: string }>("subagents:rpc:spawn", { type, prompt, options }, 30_000)
+    return rpcCall<{ id: string }>("subagents:rpc:spawn", { type, prompt, options }, 30_000,
+      onLateSpawn && (d => { debug("spawn:late", d); onLateSpawn(d.id); }))
       .then(d => { debug("spawn:ok", d); return d.id; });
   }
 
-  /** Stop a subagent via pi.events RPC (requires @tintinweb/pi-subagents extension). */
-  function stopSubagent(agentId: string): Promise<void> {
-    return rpcCall<void>("subagents:rpc:stop", { agentId }, 10_000).catch(() => {});
+  /** Record a spawned agent against its task so lifecycle events, TaskStop and TaskOutput find it. */
+  function bindAgent(taskId: string, agentId: string): void {
+    agentTaskMap.set(agentId, taskId);
+    const task = store.get(taskId);
+    store.update(taskId, { owner: agentId, metadata: { ...task?.metadata, agentId } });
+    widget.setActiveTask(taskId);
+  }
+
+  /** A spawn reply that arrived after its timeout: link the agent if the task is still
+   *  waiting for it, otherwise stop it — the task was reset or deleted, a retry may
+   *  already have started a replacement, or the session switched to a store whose
+   *  task IDs restart at 1 and would point at an unrelated task. */
+  function adoptLateAgent(spawnStore: TaskStore, taskId: string, agentId: string): void {
+    const task = store === spawnStore ? store.get(taskId) : undefined;
+    if (task?.status === "in_progress" && !task.metadata?.agentId) {
+      bindAgent(taskId, agentId);
+      widget.update();
+    } else {
+      void stopSubagent(agentId);
+    }
+  }
+
+  /** Stop a subagent via pi.events RPC (requires @tintinweb/pi-subagents extension).
+   *  Resolves true if the stop was confirmed, false if the RPC errored or timed out. */
+  function stopSubagent(agentId: string): Promise<boolean> {
+    return rpcCall<void>("subagents:rpc:stop", { agentId }, 10_000).then(() => true).catch(() => false);
   }
 
   /** Tell subagents its result has been handed to the model, which suppresses the
@@ -317,6 +358,7 @@ export default function (pi: ExtensionAPI) {
       );
       for (const next of unblocked) {
         store.update(next.id, { status: "in_progress" });
+        const spawnStore = store;
         const prompt = buildTaskPrompt(next, cascadeConfig.additionalContext);
         try {
           const agentId = await spawnSubagent(next.metadata.agentType, prompt, {
@@ -324,12 +366,14 @@ export default function (pi: ExtensionAPI) {
             isBackground: true,
             maxTurns: cascadeConfig.maxTurns,
             ...(cascadeConfig.model ? { model: cascadeConfig.model } : {}),
-          });
-          agentTaskMap.set(agentId, next.id);
-          store.update(next.id, { owner: agentId, metadata: { ...next.metadata, agentId } });
-          widget.setActiveTask(next.id);
+          }, lateId => adoptLateAgent(spawnStore, next.id, lateId));
+          bindAgent(next.id, agentId);
         } catch (err: any) {
-          store.update(next.id, { status: "pending", metadata: { ...next.metadata, result: null, lastError: err.message } });
+          // A timeout does not prove the agent never started: stay in_progress and let a
+          // late reply link it (see TaskExecute).
+          if (!err?.timeout) {
+            store.update(next.id, { status: "pending", metadata: { ...next.metadata, result: null, lastError: err.message } });
+          }
         }
       }
     }
@@ -1092,12 +1136,21 @@ Set up task dependencies:
         }
         const task = store.get(resolvedId);
         if (task?.metadata?.agentId && task.status === "in_progress") {
-          store.update(resolvedId, { status: "completed" });
-          autoClear.trackCompletion(resolvedId, cadence.currentTurn);
-          await stopSubagent(task.metadata.agentId);
+          // Stop first so the message can reflect the real outcome. The task is marked
+          // completed either way (best-effort stop): a confirmed stop settles it, and an
+          // unconfirmed one still reconciles through the subagents:failed listener if the
+          // agent reports later — agentTaskMap keeps the mapping until then.
+          const confirmed = await stopSubagent(task.metadata.agentId);
+          // A lifecycle listener may have settled the task during the await; keep its outcome.
+          if (store.get(resolvedId)?.status === "in_progress") {
+            store.update(resolvedId, { status: "completed" });
+            autoClear.trackCompletion(resolvedId, cadence.currentTurn);
+          }
           widget.setActiveTask(resolvedId, false);
           widget.update();
-          return textResult(`Task #${resolvedId} stopped successfully`);
+          return textResult(confirmed
+            ? `Task #${resolvedId} stopped`
+            : `Task #${resolvedId} stop requested — not confirmed; it will reconcile when the agent reports.`);
         }
         throw new Error(`No running background process for task ${taskId}`);
       }
@@ -1180,6 +1233,7 @@ Set up task dependencies:
 
         // Mark in_progress and spawn agent via RPC
         store.update(taskId, { status: "in_progress" });
+        const spawnStore = store;
         const prompt = buildTaskPrompt(task, params.additional_context);
         try {
           const agentId = await spawnSubagent(task.metadata.agentType, prompt, {
@@ -1187,15 +1241,20 @@ Set up task dependencies:
             isBackground: true,
             maxTurns: params.max_turns,
             ...(params.model ? { model: params.model } : {}),
-          });
-          agentTaskMap.set(agentId, taskId);
-          store.update(taskId, { owner: agentId, metadata: { ...task.metadata, agentId } });
-          widget.setActiveTask(taskId);
+          }, lateId => adoptLateAgent(spawnStore, taskId, lateId));
+          bindAgent(taskId, agentId);
           launched.push(`#${taskId} → agent ${agentId}`);
         } catch (err: any) {
           debug(`spawn:error task=#${taskId}`, err);
-          store.update(taskId, { status: "pending" });
-          results.push(`#${taskId}: spawn failed — ${err.message}`);
+          if (err?.timeout) {
+            // A timeout does not prove the agent never started. Reverting to pending
+            // would invite a duplicate spawn, so leave it in_progress; a late reply
+            // links the agent via adoptLateAgent.
+            results.push(`#${taskId}: spawn timed out — the agent is linked if its reply arrives late; if none appears, reset with TaskUpdate status=pending before retrying`);
+          } else {
+            store.update(taskId, { status: "pending" });
+            results.push(`#${taskId}: spawn failed — ${err.message}`);
+          }
         }
       }
 

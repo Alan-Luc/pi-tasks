@@ -259,6 +259,37 @@ describe("TaskStore (in-memory)", () => {
     expect(warnings).toEqual([]);
   });
 
+  it("warns when a task moves to in_progress while it has open blockers (#71)", () => {
+    store.create("Blocker", "Desc"); // #1, pending
+    store.create("Blocked", "Desc"); // #2
+    store.update("2", { addBlockedBy: ["1"] });
+
+    // #1 is still pending, so #2 is blocked — the status change succeeds but warns.
+    const { task, warnings } = store.update("2", { status: "in_progress" });
+    expect(task!.status).toBe("in_progress");
+    expect(warnings.some(w => w.includes("open blockers") && w.includes("#1"))).toBe(true);
+  });
+
+  it("does not warn once the blocker is completed (#71)", () => {
+    store.create("Blocker", "Desc"); // #1
+    store.create("Blocked", "Desc"); // #2
+    store.update("2", { addBlockedBy: ["1"] });
+    store.update("1", { status: "completed" });
+
+    const { warnings } = store.update("2", { status: "in_progress" });
+    expect(warnings).toEqual([]);
+  });
+
+  it("does not repeat the blocker warning when the status is unchanged (#71)", () => {
+    store.create("Blocker", "Desc"); // #1
+    store.create("Blocked", "Desc"); // #2
+    store.update("2", { addBlockedBy: ["1"] });
+    store.update("2", { status: "in_progress" });
+
+    const { warnings } = store.update("2", { status: "in_progress" });
+    expect(warnings).toEqual([]);
+  });
+
   it("accepts whitespace-only subjects (matches Claude Code)", () => {
     const t = store.create("   ", "Desc");
     expect(t.subject).toBe("   ");
