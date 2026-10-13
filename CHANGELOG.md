@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-13
+
 ### Fixed
 - **`typebox` moves to a `"*"` peer dependency, silencing pi's host-package startup warning.** Since pi 0.99.0, pi warns at load when an extension lists a host-provided module in `dependencies`, because an installed copy can bypass the extension loader and create a duplicate runtime module. pi already injects its own `typebox` at runtime, so nothing changes under pi; it stays pinned in `devDependencies` for tests and type checks, and a non-pi host must now provide it. ([#66](https://github.com/tintinweb/pi-tasks/issues/66) — thanks [@kevinkirkup](https://github.com/kevinkirkup) — [#68](https://github.com/tintinweb/pi-tasks/issues/68) — thanks [@s85io](https://github.com/s85io) — and [#67](https://github.com/tintinweb/pi-tasks/pull/67) — thanks [@rebelthor](https://github.com/rebelthor))
 - **The task widget's spinner no longer keeps `pi -p` alive after a run.** The animation runs on a 150ms interval that was cleared only when the task list emptied or no task was active, so a session ending with a task still `in_progress` left it running and kept Node's event loop busy — non-interactive `pi -p` never exited. It is now disposed on `session_shutdown` and restarts on the next session if a task is still active. ([#65](https://github.com/tintinweb/pi-tasks/pull/65) — thanks [@smantzavinos](https://github.com/smantzavinos))
@@ -246,6 +248,7 @@ Initial release — Claude Code-style task tracking and coordination for pi.
 - **Background process tracker** — output buffering (stdout + stderr), waiter notification, graceful stop with timeout escalation (SIGTERM → 5s → SIGKILL).
 - **78 unit tests** — task store CRUD, dependencies, warnings, file persistence; widget rendering, icons, spinners, token/duration formatting; process tracker lifecycle.
 
+[0.9.1]: https://github.com/tintinweb/pi-tasks/releases/tag/v0.9.1
 [0.9.0]: https://github.com/tintinweb/pi-tasks/releases/tag/v0.9.0
 [0.8.0]: https://github.com/tintinweb/pi-tasks/releases/tag/v0.8.0
 [0.7.3]: https://github.com/tintinweb/pi-tasks/releases/tag/v0.7.3

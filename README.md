@@ -16,7 +16,7 @@ https://github.com/user-attachments/assets/1d0ee87a-e0a5-4bfa-a9b9-2f9144cb905b
 - **Persistent widget** — live task list above the editor with `✔`/`◼`/`◻` status marks, task numbers (`#1`, `#2`, …), strikethrough for completed tasks, star spinner (`✳✽`) for active tasks with elapsed time and token counts. Every glyph is [configurable](CUSTOMIZING.md#task-glyphs)
 - **System-reminder injection** — periodic `<system-reminder>` nudges injected into the upcoming LLM request (via the `context` hook, transient and never persisted) when task tools haven't been used recently, or when a task is left stuck `in_progress` after a text-only turn. Shaped after Claude Code's todo reminders — an empty-list nudge or a JSON echo of the current list (capped at 10 tasks)
 - **Prompt guidelines** — workflow contract encoded in tool descriptions, nudging the LLM at the point of tool use
-- **Dependency management** — bidirectional `blocks`/`blockedBy` relationships with warnings for cycles, self-deps, and dangling references
+- **Dependency management** — bidirectional `blocks`/`blockedBy` relationships with warnings for cycles, self-deps, dangling references, and status changes that bypass open blockers
 - **Shared task lists** — multiple pi sessions can share a file-backed task list for agent team coordination
 - **File locking** — concurrent access is safe when multiple sessions share a task list
 - **Background process tracking** — track spawned processes with output buffering, blocking wait, and graceful stop
@@ -176,7 +176,7 @@ For a subagent task that has finished, the tool returns the agent's stored resul
 
 ### `TaskStop`
 
-Stop a running background task process. Sends SIGTERM, waits 5 seconds, then SIGKILL. For subagent tasks, sends a stop RPC.
+Stop a running background task process. Sends SIGTERM, waits 5 seconds, then SIGKILL. For subagent tasks, sends a stop RPC and reports whether the stop was confirmed (`Task #N stopped`) or not (`stop requested — not confirmed`); the task is marked `completed` either way, and a later lifecycle event from the agent still settles its real outcome.
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -209,7 +209,7 @@ Tasks are created as `pending`. Mark `in_progress` before starting work, `comple
 ## Dependency Management
 
 - **Bidirectional edges:** `addBlocks`/`addBlockedBy` maintain both sides automatically
-- **Dependency warnings:** cycles, self-dependencies, and references to non-existent tasks are stored but produce warnings in the tool response
+- **Dependency warnings:** cycles, self-dependencies, and references to non-existent tasks are stored but produce warnings in the tool response. So does `TaskUpdate` moving a task to `in_progress` or `completed` while a blocker is unfinished — `TaskExecute` refuses that, `TaskUpdate` applies it and warns
 - **Display-time filtering:** `TaskList` only shows non-completed blockers in `[blocked by ...]`
 - **Raw data preserved:** `TaskGet` shows ALL edges, including completed blockers
 - **Cleanup on deletion:** removing a task cleans up all edges pointing to it
@@ -352,7 +352,7 @@ pi-tasks                                pi-subagents
    │                                         │
 ```
 
-The returned `id` is stored in an in-memory `agentTaskMap` (agentId → taskId) for O(1) completion lookup. A 30-second timeout rejects the Promise if no reply arrives.
+The returned `id` is stored in an in-memory `agentTaskMap` (agentId → taskId) for O(1) completion lookup. A 30-second timeout rejects the Promise if no reply arrives, but the task stays `in_progress` and the reply listener is kept for five more minutes: a late reply links the agent to the task, and a reply for a task that was reset, retried or left behind by a session switch stops that agent instead. If nothing arrives, reset the task with `TaskUpdate status=pending` before retrying.
 
 ### Lifecycle Events
 
