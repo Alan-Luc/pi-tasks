@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`typebox` moves to a `"*"` peer dependency, silencing pi's host-package startup warning.** Since pi 0.99.0, pi warns at load when an extension lists a host-provided module in `dependencies`, because an installed copy can bypass the extension loader and create a duplicate runtime module. pi already injects its own `typebox` at runtime, so nothing changes under pi; it stays pinned in `devDependencies` for tests and type checks, and a non-pi host must now provide it. ([#66](https://github.com/tintinweb/pi-tasks/issues/66) — thanks [@kevinkirkup](https://github.com/kevinkirkup) — and [#67](https://github.com/tintinweb/pi-tasks/pull/67) — thanks [@rebelthor](https://github.com/rebelthor))
+
 ## [0.9.0] - 2026-08-24
 
 ### Added
