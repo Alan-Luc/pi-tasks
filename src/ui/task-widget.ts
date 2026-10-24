@@ -11,7 +11,8 @@
  * replace — see task-glyphs.ts.
  */
 
-import { truncateToWidth } from "@earendil-works/pi-tui";
+import type { Theme as PiTheme } from "@earendil-works/pi-coding-agent";
+import { type Component, type TUI, truncateToWidth } from "@earendil-works/pi-tui";
 import { resolveTaskGlyphs } from "../task-glyphs.js";
 import type { TaskStore } from "../task-store.js";
 import type { TasksConfig } from "../tasks-config.js";
@@ -32,17 +33,21 @@ const TRUNCATE_FNS = { top: truncateFromTop, bottom: truncateFromBottom };
 
 // ---- Types ----
 
-export type Theme = {
-  fg(color: string, text: string): string;
-  bold(text: string): string;
-  strikethrough(text: string): string;
-};
+export type Theme = Pick<PiTheme, "fg" | "bold" | "strikethrough">;
+
+export const TASKS_WIDGET_HOST_EVENT = "pi-background-tasks:tasks-widget-host:v1";
+export type TasksWidgetFactory = (tui: Pick<TUI, "requestRender">, theme: Theme) => Component;
+
+export interface TasksWidgetHostV1 {
+  readonly version: 1;
+  setTasksWidget(factory: TasksWidgetFactory | undefined): boolean;
+}
 
 export type UICtx = {
   setStatus(key: string, text: string | undefined): void;
   setWidget(
     key: string,
-    content: undefined | ((tui: any, theme: Theme) => { render(): string[]; invalidate(): void }),
+    content: undefined | TasksWidgetFactory,
     options?: { placement?: "aboveEditor" | "belowEditor" },
   ): void;
 };
@@ -78,6 +83,7 @@ function formatTokens(n: number): string {
 
 export class TaskWidget {
   private uiCtx: UICtx | undefined;
+  private disposed = false;
   private widgetFrame = 0;
   private widgetInterval: ReturnType<typeof setInterval> | undefined;
   /** IDs of tasks currently being actively executed (show spinner). */
@@ -85,7 +91,8 @@ export class TaskWidget {
   /** Per-task runtime metrics keyed by task ID. */
   private metrics = new Map<string, TaskMetrics>();
   /** Cached TUI instance for requestRender() calls. */
-  private tui: any | undefined;
+  private tui: Pick<TUI, "requestRender"> | undefined;
+  private host: TasksWidgetHostV1 | undefined;
   /** Whether the widget callback is currently registered. */
   private widgetRegistered = false;
 
@@ -100,6 +107,22 @@ export class TaskWidget {
 
   setUICtx(ctx: UICtx) {
     this.uiCtx = ctx;
+    this.disposed = false;
+  }
+
+  setHost(host: TasksWidgetHostV1) {
+    if (this.host === host) return;
+    this.clearWidget();
+    this.host = host;
+    this.update();
+  }
+
+  private clearWidget() {
+    if (!this.widgetRegistered) return;
+    if (this.host) this.host.setTasksWidget(undefined);
+    else this.uiCtx?.setWidget("tasks", undefined);
+    this.widgetRegistered = false;
+    this.tui = undefined;
   }
 
   /** Add or remove a task from the active spinner set. */
@@ -132,7 +155,7 @@ export class TaskWidget {
    *  nowhere else: `update()` also runs on every task mutation and tool execution,
    *  so incrementing there tied the animation speed to how busy the agent was. */
   ensureTimer() {
-    if (!this.widgetInterval) {
+    if (!this.disposed && this.widgetRegistered && !this.widgetInterval) {
       this.widgetInterval = setInterval(() => {
         this.widgetFrame++;
         this.update();
@@ -143,23 +166,22 @@ export class TaskWidget {
   /** Render callback entry point. Guarded so a render error can never escape to
    *  the TUI timer and crash the whole host process — worst case the widget is
    *  empty for one frame. */
-  private renderWidget(tui: any, theme: Theme): string[] {
+  private renderWidget(width: number, theme: Theme): string[] {
     try {
-      return this.buildWidgetLines(tui, theme);
+      return this.buildWidgetLines(width, theme);
     } catch {
       return [];
     }
   }
 
   /** Build widget lines from current live state. */
-  private buildWidgetLines(tui: any, theme: Theme): string[] {
+  private buildWidgetLines(width: number, theme: Theme): string[] {
     const sortOrder = this.config.sortOrder ?? "id";
     // Resolved per render, not cached: the extension swaps this config object's
     // contents when the host moves to a session in another workspace.
     const glyphs = resolveTaskGlyphs(this.config.glyphs);
     const tasks = this.store.list(sortOrder);
-    const w = tui.terminal.columns;
-    const truncate = (line: string) => truncateToWidth(line, w, glyphs.truncation);
+    const truncate = (line: string) => truncateToWidth(line, width, glyphs.truncation);
 
     if (tasks.length === 0) return [];
 
@@ -264,15 +286,12 @@ export class TaskWidget {
 
   /** Force an immediate widget update. */
   update() {
-    if (!this.uiCtx) return;
+    if (this.disposed || (!this.uiCtx && !this.host)) return;
     const tasks = this.store.list();
 
     // Transition: visible → hidden
     if (tasks.length === 0) {
-      if (this.widgetRegistered) {
-        this.uiCtx.setWidget("tasks", undefined);
-        this.widgetRegistered = false;
-      }
+      this.clearWidget();
       if (this.widgetInterval) {
         clearInterval(this.widgetInterval);
         this.widgetInterval = undefined;
@@ -289,37 +308,40 @@ export class TaskWidget {
       }
     }
 
-    // Check if any task needs animation
-    const hasActiveSpinner = tasks.some(t => this.activeTaskIds.has(t.id) && t.status === "in_progress");
-    if (hasActiveSpinner) {
-      this.ensureTimer();
-    } else if (!hasActiveSpinner && this.widgetInterval) {
-      clearInterval(this.widgetInterval);
-      this.widgetInterval = undefined;
-    }
-
     // Transition: hidden → visible — register widget callback once
     if (!this.widgetRegistered) {
-      this.uiCtx.setWidget("tasks", (tui, theme) => {
+      const create: TasksWidgetFactory = (tui, theme) => {
         this.tui = tui;
-        return { render: () => this.renderWidget(tui, theme), invalidate: () => {} };
-      }, { placement: "aboveEditor" });
+        return { render: width => this.renderWidget(width, theme), invalidate: () => {} };
+      };
+      if (this.host && !this.host.setTasksWidget(create)) this.host = undefined;
+      if (!this.host) {
+        if (!this.uiCtx) return;
+        this.uiCtx.setWidget("tasks", create, { placement: "aboveEditor" });
+      }
       this.widgetRegistered = true;
     } else if (this.tui) {
       // Widget already registered — just request a re-render
       this.tui.requestRender();
     }
+
+    const hasActiveSpinner = tasks.some(t => this.activeTaskIds.has(t.id) && t.status === "in_progress");
+    if (hasActiveSpinner) {
+      this.ensureTimer();
+    } else if (this.widgetInterval) {
+      clearInterval(this.widgetInterval);
+      this.widgetInterval = undefined;
+    }
   }
 
   dispose() {
+    this.disposed = true;
     if (this.widgetInterval) {
       clearInterval(this.widgetInterval);
       this.widgetInterval = undefined;
     }
-    if (this.uiCtx) {
-      this.uiCtx.setWidget("tasks", undefined);
-    }
-    this.widgetRegistered = false;
-    this.tui = undefined;
+    this.clearWidget();
+    this.host = undefined;
+    this.uiCtx = undefined;
   }
 }
