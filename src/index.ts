@@ -34,7 +34,7 @@ import { TaskStore } from "./task-store.js";
 import { loadGlobalTasksConfig, loadTasksConfig } from "./tasks-config.js";
 import type { Task } from "./types.js";
 import { openSettingsMenu } from "./ui/settings-menu.js";
-import { TaskWidget, type UICtx } from "./ui/task-widget.js";
+import { TASKS_WIDGET_HOST_EVENT, type TasksWidgetHostV1, TaskWidget, type UICtx } from "./ui/task-widget.js";
 
 // ---- Debug ----
 
@@ -126,6 +126,12 @@ function buildSystemReminder(tasks: Task[]): string {
   ].join("\n");
 }
 
+function isTasksWidgetHost(value: unknown): value is TasksWidgetHostV1 {
+  return typeof value === "object" && value !== null &&
+    "version" in value && value.version === 1 &&
+    "setTasksWidget" in value && typeof value.setTasksWidget === "function";
+}
+
 export default function (pi: ExtensionAPI) {
   // Project overrides require ExtensionContext.cwd, which is unavailable while
   // the extension factory runs. Start with global defaults, then merge the
@@ -165,6 +171,10 @@ export default function (pi: ExtensionAPI) {
   let store = new TaskStore(storeTarget.path);
   const tracker = new ProcessTracker();
   const widget = new TaskWidget(store, cfg);
+  pi.events.on(TASKS_WIDGET_HOST_EVENT, (host: unknown) => {
+    if (isTasksWidgetHost(host)) widget.setHost(host);
+  });
+  pi.on("session_shutdown", async () => widget.dispose());
 
   // ── Subagent integration state ──
   /** Latest ExtensionContext — refreshed on every tool execution so cascade always has a valid one. */

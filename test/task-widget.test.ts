@@ -1,7 +1,8 @@
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TaskStore } from "../src/task-store.js";
 import type { TasksConfig } from "../src/tasks-config.js";
-import { TaskWidget, type Theme, type UICtx } from "../src/ui/task-widget.js";
+import { type TasksWidgetFactory, type TasksWidgetHostV1, TaskWidget, type Theme, type UICtx } from "../src/ui/task-widget.js";
 
 /** Create a mock theme that returns raw text (no ANSI escapes). */
 function mockTheme(): Theme {
@@ -15,7 +16,10 @@ function mockTheme(): Theme {
 /** Create a mock UICtx that captures setWidget calls. */
 function mockUICtx() {
   const state: {
-    widgets: Map<string, any>;
+    widgets: Map<string, {
+      content: Parameters<UICtx["setWidget"]>[1];
+      options: Parameters<UICtx["setWidget"]>[2];
+    }>;
     statuses: Map<string, string | undefined>;
   } = {
     widgets: new Map(),
@@ -41,7 +45,7 @@ function renderWidget(state: ReturnType<typeof mockUICtx>["state"], columns = 20
   const theme = mockTheme();
   const tui = { terminal: { columns }, requestRender() {} };
   const result = entry.content(tui, theme);
-  return result.render();
+  return result.render(columns);
 }
 
 describe("TaskWidget", () => {
@@ -60,6 +64,111 @@ describe("TaskWidget", () => {
   afterEach(() => {
     widget.dispose();
     vi.useRealTimers();
+  });
+
+  it("honors supplied render width independently of terminal columns", () => {
+    store.create("A subject far too long for a twenty-four column pane", "Desc");
+    widget.update();
+    const create = ui.state.widgets.get("tasks")?.content;
+    if (!create) throw new Error("standalone widget must be registered");
+    const tui = { terminal: { columns: 200 }, requestRender() {} };
+    const component = create(tui, mockTheme());
+    const lines: string[] = component.render(24);
+    expect(Math.max(...lines.map(line => visibleWidth(line)))).toBeLessThanOrEqual(24);
+    expect(lines[1]).not.toContain("column pane");
+  });
+
+  it("transfers its live presentation to a host without duplicating state or timers", () => {
+    store.create("Hosted task", "Desc", "Working");
+    store.update("1", { status: "in_progress" });
+    widget.setActiveTask("1");
+    const calls: Array<TasksWidgetFactory | undefined> = [];
+    const host: TasksWidgetHostV1 = {
+      version: 1,
+      setTasksWidget(create) { calls.push(create); return true; },
+    };
+    widget.setHost(host);
+    expect(ui.state.widgets.get("tasks")?.content).toBeUndefined();
+    expect(calls).toHaveLength(1);
+    const create = calls[0];
+    if (!create) throw new Error("host must receive the Tasks factory");
+    const component = create({ requestRender() {} }, mockTheme());
+    widget.addTokenUsage(12, 34);
+    expect(component.render(80)[1]).toContain("Working…");
+    expect(component.render(80)[1]).toContain("↑ 12");
+    const first = component.render(80)[1];
+    widget.setHost(host);
+    expect(calls).toHaveLength(1);
+    vi.advanceTimersByTime(150);
+    expect(component.render(80)[1]).not.toBe(first);
+    expect(vi.getTimerCount()).toBe(1);
+    store.clearAll();
+    widget.update();
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toBeUndefined();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("falls back from a closed host and cannot restart its UI after disposal", () => {
+    store.create("Fallback task", "Desc");
+    store.update("1", { status: "in_progress" });
+    const rejected: TasksWidgetHostV1 = { version: 1, setTasksWidget: vi.fn(() => false) };
+    widget.setHost(rejected);
+    expect(rejected.setTasksWidget).toHaveBeenCalledOnce();
+    expect(renderWidget(ui.state)[1]).toContain("Fallback task");
+    widget.dispose();
+    widget.update();
+    widget.setActiveTask("1");
+    expect(ui.state.widgets.get("tasks")?.content).toBeUndefined();
+    expect(vi.getTimerCount()).toBe(0);
+    widget.setUICtx(ui.ctx);
+    widget.update();
+    expect(renderWidget(ui.state)[1]).toContain("Fallback task");
+  });
+
+  it("defers late host offers until a fresh session context is bound", () => {
+    store.create("Previous session task", "Desc");
+    store.update("1", { status: "in_progress" });
+    widget.setActiveTask("1");
+    widget.dispose();
+    const offers: Array<TasksWidgetFactory | undefined> = [];
+    const host: TasksWidgetHostV1 = {
+      version: 1,
+      setTasksWidget(create) { offers.push(create); return true; },
+    };
+    widget.setHost(host);
+    expect(offers).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);
+
+    const nextStore = new TaskStore();
+    nextStore.create("New session task", "Desc");
+    widget.setUICtx(ui.ctx);
+    widget.setStore(nextStore);
+    widget.update();
+    expect(offers).toHaveLength(1);
+    const create = offers[0];
+    if (!create) throw new Error("fresh context must mount its Tasks presentation");
+    const lines = create({ requestRender() {} }, mockTheme()).render(80).join("\n");
+    expect(lines).toContain("New session task");
+    expect(lines).not.toContain("Previous session task");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("detaches the old host before moving to a replacement", () => {
+    store.create("Moving task", "Desc");
+    const calls: string[] = [];
+    const first: TasksWidgetHostV1 = {
+      version: 1,
+      setTasksWidget(create) { calls.push(create ? "first:attach" : "first:detach"); return true; },
+    };
+    const second: TasksWidgetHostV1 = {
+      version: 1,
+      setTasksWidget(create) { calls.push(create ? "second:attach" : "second:detach"); return true; },
+    };
+    widget.setHost(first);
+    widget.setHost(second);
+    widget.dispose();
+    expect(calls).toEqual(["first:attach", "first:detach", "second:attach", "second:detach"]);
   });
 
   it("shows nothing when no tasks exist", () => {

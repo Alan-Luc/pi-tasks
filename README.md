@@ -36,7 +36,9 @@ pi -e ./src/index.ts
 
 ## Widget
 
-The extension renders a persistent widget above the editor:
+The extension renders a persistent widget above the editor. This local patch can share a native row with a compatible pi-background-tasks extension: Tasks on the left, Jobs on the right. Task state, actions, styling and animation stay owned here; without the presentation host, the widget remains standalone. The renderer honors its supplied width and releases its widget and timer on session shutdown.
+
+Standalone presentation:
 
 ```
 ● 4 tasks (1 done, 1 in progress, 2 open)
