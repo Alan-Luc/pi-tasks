@@ -5,7 +5,7 @@
  * Shared (PI_TASK_LIST_ID set): ~/.pi/tasks/<listId>.json with file locking.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
@@ -73,6 +73,14 @@ function releaseLock(lockPath: string, token: string): void {
 
 function isProcessRunning(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function snapshotIdentifier(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 128;
 }
 
 /**
@@ -200,6 +208,35 @@ export class TaskStore {
   get(id: string): Task | undefined {
     if (this.filePath) this.load();
     return this.tasks.get(id);
+  }
+
+  /** Read a detached, metadata-free view only when the backing file is authoritative. */
+  readSnapshot(): { revision: string; tasks: Array<{ id: string; status: TaskStatus; owner?: string; blockedBy: string[] }> } | undefined {
+    if (!this.filePath) return undefined;
+    try {
+      const contents = readFileSync(this.filePath, "utf-8");
+      const data: unknown = JSON.parse(contents);
+      if (!isRecord(data) || !Array.isArray(data.tasks)) return undefined;
+      const ids = new Set<string>();
+      const tasks: Array<{ id: string; status: TaskStatus; owner?: string; blockedBy: string[] }> = [];
+      for (const value of data.tasks) {
+        if (!isRecord(value) || !snapshotIdentifier(value.id) || ids.has(value.id)
+          || typeof value.subject !== "string" || typeof value.description !== "string"
+          || (value.status !== "pending" && value.status !== "in_progress" && value.status !== "completed")) return undefined;
+        const rawBlockedBy = value.blockedBy;
+        if (rawBlockedBy !== undefined && !Array.isArray(rawBlockedBy)) return undefined;
+        const blockedBy: string[] = rawBlockedBy === undefined ? [] : rawBlockedBy.filter(snapshotIdentifier);
+        const owner = value.owner;
+        if ((rawBlockedBy !== undefined && blockedBy.length !== rawBlockedBy.length)
+          || new Set(blockedBy).size !== blockedBy.length
+          || (owner !== undefined && !snapshotIdentifier(owner))) return undefined;
+        ids.add(value.id);
+        tasks.push({ id: value.id, status: value.status, ...(owner === undefined ? {} : { owner }), blockedBy });
+      }
+      return { revision: createHash("sha256").update(contents).digest("hex"), tasks };
+    } catch {
+      return undefined;
+    }
   }
 
   /** List all tasks, sorted by the given order (defaults to ID ascending). */

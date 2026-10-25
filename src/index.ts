@@ -14,7 +14,8 @@
  *   /tasks       — Interactive task management menu
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -33,12 +34,32 @@ import { reclaimGlobalSessionTasksDir, sessionTaskFile } from "./task-paths.js";
 import { TaskStore } from "./task-store.js";
 import { loadGlobalTasksConfig, loadTasksConfig } from "./tasks-config.js";
 import type { Task } from "./types.js";
+import {
+  CONTINUATION_DISPOSITIONS,
+  TASK_SNAPSHOT_REQUEST,
+  TASK_SNAPSHOT_RESPONSE,
+  parseContinuationBasis,
+  parseTaskSnapshot,
+  type ContinuationBasis,
+  type ContinuationDisposition,
+} from "./task-snapshot.js";
+import { registerHumanInputTracker } from "./human-input.js";
 import { openSettingsMenu } from "./ui/settings-menu.js";
 import { TASKS_WIDGET_HOST_EVENT, type TasksWidgetHostV1, TaskWidget, type UICtx } from "./ui/task-widget.js";
 
 // ---- Debug ----
 
 const DEBUG = !!process.env.PI_TASKS_DEBUG;
+type RuntimeContinuation = {
+  taskId: string;
+  sessionId: string;
+  storeId: string;
+  disposition: ContinuationDisposition;
+  basis: ContinuationBasis;
+  revision: string;
+  planDigest?: string;
+};
+
 function debug(...args: unknown[]) {
   if (DEBUG) console.error("[pi-tasks]", ...args);
 }
@@ -181,10 +202,101 @@ export default function (pi: ExtensionAPI) {
   // ── Subagent integration state ──
   /** Latest ExtensionContext — refreshed on every tool execution so cascade always has a valid one. */
   let latestCtx: ExtensionContext | undefined;
+  let snapshotGeneration = randomUUID();
+  let activeSessionId: string | undefined;
+  let currentContinuation: RuntimeContinuation | undefined;
+  const humanInputs = registerHumanInputTracker(pi);
   /** Cascade config — set by TaskExecute, consumed by completion listener. */
   let cascadeConfig: { additionalContext?: string; model?: string; maxTurns?: number } | undefined;
   /** Maps agent IDs to task IDs for O(1) completion lookup. */
   const agentTaskMap = new Map<string, string>();
+
+  function snapshotStoreId(storeKey: string): string {
+    return createHash("sha256").update(storeKey).digest("hex");
+  }
+
+  function planDigest(ctx: ExtensionContext, basis: ContinuationBasis): string | undefined {
+    if (basis.kind !== "plan") return undefined;
+    try {
+      const workspace = realpathSync(ctx.cwd);
+      const path = resolve(workspace, basis.plan);
+      const info = lstatSync(path);
+      if (info.isSymbolicLink() || !info.isFile() || realpathSync(path) !== path) return undefined;
+      const contents = readFileSync(path, "utf8");
+      return contents.includes(basis.decisionAnchor) ? createHash("sha256").update(contents).digest("hex") : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  function validateContinuationBasis(ctx: ExtensionContext, sessionId: string, basis: ContinuationBasis) {
+    const branch = ctx.sessionManager.getBranch();
+    const position = (entryId: string) => {
+      if (!humanInputs.isHumanEntry(ctx, entryId)) return -1;
+      return branch.findIndex((entry) => entry.id === entryId && entry.type === "message" && entry.message.role === "user");
+    };
+    const current = humanInputs.current(ctx);
+    const inputPosition = current?.entryId === basis.inputEntryId && current.sessionId === sessionId
+      ? position(basis.inputEntryId)
+      : -1;
+    if (inputPosition < 0) return { valid: false as const, disposition: "unknown" as const };
+    const requestPosition = position(basis.requestEntryId);
+    if (requestPosition < 0 || requestPosition > inputPosition) return { valid: false as const, disposition: "unknown" as const };
+    if (basis.kind === "request") return { valid: true as const };
+    const approvalPosition = position(basis.approvalEntryId);
+    const digest = planDigest(ctx, basis);
+    if (approvalPosition < 0 || approvalPosition > inputPosition || !digest) {
+      return { valid: false as const, disposition: "approval-required" as const };
+    }
+    return { valid: true as const, planDigest: digest };
+  }
+
+  function continuationForSnapshot(ctx: ExtensionContext, sessionId: string, storeId: string, revision: string, tasks: Array<{ id: string; status: string }>) {
+    const continuation = currentContinuation;
+    if (!continuation || continuation.sessionId !== sessionId || continuation.storeId !== storeId
+      || continuation.revision !== revision || !tasks.some((task) => task.id === continuation.taskId && task.status !== "completed")) return null;
+    const validation = validateContinuationBasis(ctx, sessionId, continuation.basis);
+    const disposition = validation.valid
+      ? continuation.planDigest !== undefined && validation.planDigest !== continuation.planDigest
+        ? "approval-required"
+        : continuation.disposition
+      : validation.disposition;
+    return {
+      taskId: continuation.taskId,
+      disposition,
+      basis: continuation.basis,
+      revision,
+    };
+  }
+
+  pi.on("input", (event) => {
+    if (event.source === "interactive" || event.source === "rpc") currentContinuation = undefined;
+  });
+  pi.on("session_tree", () => { currentContinuation = undefined; });
+
+  pi.events.on(TASK_SNAPSHOT_REQUEST, (raw: unknown) => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
+    const request = raw as Record<string, unknown>;
+    if (request.version !== 1 || typeof request.requestId !== "string" || request.requestId.length === 0 || request.requestId.length > 128
+      || typeof request.sessionId !== "string" || request.sessionId.length === 0 || request.sessionId.length > 128
+      || Object.keys(request).some((key) => !["version", "requestId", "sessionId"].includes(key))) return;
+    const ctx = latestCtx;
+    const sessionId = ctx?.sessionManager.getSessionId();
+    if (!ctx || !sessionId || request.sessionId !== sessionId || activeSessionId !== sessionId
+      || !configuredCwd || configuredCwd !== ctx.cwd || !ctx.sessionManager.getSessionFile() || piTasks || !isSessionScope()) return;
+    const expected = resolveStoreTarget(ctx.cwd, sessionId);
+    if (!expected.path || expected.key !== storeTarget.key || expected.path !== storeTarget.path) return;
+    const snapshot = store.readSnapshot();
+    if (!snapshot) return;
+    const storeId = snapshotStoreId(expected.key);
+    const continuation = continuationForSnapshot(ctx, sessionId, storeId, snapshot.revision, snapshot.tasks);
+    const response = parseTaskSnapshot({
+      version: 1, requestId: request.requestId, sessionId,
+      generation: snapshotGeneration, storeId, scope: "session-file",
+      revision: snapshot.revision, tasks: snapshot.tasks, continuation,
+    });
+    if (response) pi.events.emit(TASK_SNAPSHOT_RESPONSE, response);
+  });
 
   // ── Subagent RPC helpers ──
 
@@ -441,6 +553,7 @@ export default function (pi: ExtensionAPI) {
       : undefined;
     const nextTarget = resolveStoreTarget(ctx.cwd, sessionId);
     if (nextTarget.key !== storeTarget.key) {
+      currentContinuation = undefined;
       store = new TaskStore(nextTarget.path);
       widget.setStore(store);
       storeTarget = nextTarget;
@@ -614,6 +727,12 @@ export default function (pi: ExtensionAPI) {
     // cached), so session-scoped state must be reset. startup/reload re-run the
     // factory and start clean.
     const isSwitch = reason === "new" || reason === "resume" || reason === "fork";
+    const sessionId = ctx.sessionManager.getSessionId();
+    if (isSwitch || reason === "reload" || activeSessionId !== sessionId) {
+      currentContinuation = undefined;
+      snapshotGeneration = randomUUID();
+    }
+    activeSessionId = sessionId;
     // A fork branches the conversation, so its tasks carry over as an independent
     // copy. Snapshot before the store re-points to the new (empty) session file.
     const forkSeed = reason === "fork" ? store.snapshot() : undefined;
@@ -652,6 +771,10 @@ export default function (pi: ExtensionAPI) {
   // event loop busy, so `pi -p` never exits once a task has been in progress.
   // new/resume/fork re-run session_start, whose update() restarts it if needed.
   pi.on("session_shutdown", async () => {
+    latestCtx = undefined;
+    activeSessionId = undefined;
+    currentContinuation = undefined;
+    snapshotGeneration = randomUUID();
     widget.dispose();
   });
 
@@ -893,6 +1016,24 @@ Returns full task details:
   // Tool 4: TaskUpdate
   // ──────────────────────────────────────────────────
 
+  const continuationBasisSchema = Type.Union([
+    Type.Object({
+      kind: Type.Literal("request"),
+      requestEntryId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+    }, { additionalProperties: false }),
+    Type.Object({
+      kind: Type.Literal("plan"),
+      requestEntryId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+      plan: Type.String({ minLength: 1, maxLength: 1024, pattern: "^\\.harness/plans/\\d{4}-\\d{2}-\\d{2}-[a-z0-9]+(?:-[a-z0-9]+)*\\.md$" }),
+      decisionAnchor: Type.String({ minLength: 1, maxLength: 1024 }),
+      approvalEntryId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+    }, { additionalProperties: false }),
+  ]);
+  const continuationSchema = Type.Object({
+    disposition: Type.Unsafe<ContinuationDisposition>({ type: "string", enum: [...CONTINUATION_DISPOSITIONS] }),
+    basis: continuationBasisSchema,
+  }, { additionalProperties: false });
+
   pi.registerTool({
     name: "TaskUpdate",
     label: "TaskUpdate",
@@ -926,6 +1067,10 @@ Returns full task details:
 **Update task details:**
 - When requirements change or become clearer
 - When establishing dependencies between tasks
+
+## Continuation reconciliation (optional)
+
+\`continuation\` records runtime-only work state against the current native human input. Use a request basis for ordinary work, or a plan basis with its canonical plan path and decision anchor for explicit-plan work. Entry IDs default to the current input; supplied request/approval references must be source-backed entries on this branch. This is not permission or approval; existing gates retain that authority.
 
 ## Fields You Can Update
 
@@ -988,11 +1133,22 @@ Set up task dependencies:
       metadata: Type.Optional(Type.Record(Type.String(), Type.Any(), { description: "Metadata keys to merge into the task. Set a key to null to delete it." })),
       addBlocks: Type.Optional(Type.Array(Type.String(), { description: "Task IDs that this task blocks" })),
       addBlockedBy: Type.Optional(Type.Array(Type.String(), { description: "Task IDs that block this task" })),
+      continuation: Type.Optional(continuationSchema),
     }),
 
-    execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-      const { taskId, ...fields } = params;
-      const { task, changedFields, warnings } = store.update(taskId, fields);
+    execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const { taskId, continuation, ...fields } = params;
+      if (continuation) currentContinuation = undefined;
+      let task: Task | undefined;
+      let changedFields: string[];
+      let warnings: string[];
+      if (continuation && Object.values(fields).every((value) => value === undefined)) {
+        task = store.get(taskId);
+        changedFields = [];
+        warnings = [];
+      } else {
+        ({ task, changedFields, warnings } = store.update(taskId, fields));
+      }
 
       if (changedFields.length === 0 && !task) {
         return Promise.resolve(textResult(`Task #${taskId} not found`));
@@ -1009,8 +1165,51 @@ Set up task dependencies:
         if (fields.status === "completed") autoClear.trackCompletion(taskId, cadence.currentTurn);
       }
 
+      let reconciledDisposition: ContinuationDisposition | undefined;
+      if (continuation && task) {
+        const sessionId = ctx.sessionManager.getSessionId();
+        const expected = resolveStoreTarget(ctx.cwd, sessionId);
+        const supported = !piTasks && isSessionScope() && Boolean(ctx.sessionManager.getSessionFile())
+          && activeSessionId === sessionId && configuredCwd === ctx.cwd
+          && Boolean(expected.path) && expected.key === storeTarget.key && expected.path === storeTarget.path;
+        const snapshot = supported ? store.readSnapshot() : undefined;
+        const input = supported ? humanInputs.current(ctx) : undefined;
+        const basis = input?.sessionId === sessionId
+          ? parseContinuationBasis(continuation.basis.kind === "request"
+            ? { kind: "request", inputEntryId: input.entryId, requestEntryId: continuation.basis.requestEntryId ?? input.entryId }
+            : {
+              kind: "plan", inputEntryId: input.entryId,
+              requestEntryId: continuation.basis.requestEntryId ?? input.entryId,
+              plan: continuation.basis.plan, decisionAnchor: continuation.basis.decisionAnchor,
+              approvalEntryId: continuation.basis.approvalEntryId ?? input.entryId,
+            })
+          : undefined;
+        if (snapshot && basis) {
+          const validation = validateContinuationBasis(ctx, sessionId, basis);
+          reconciledDisposition = task.status === "completed"
+            ? "unknown"
+            : validation.valid ? continuation.disposition : validation.disposition;
+          currentContinuation = {
+            taskId,
+            sessionId,
+            storeId: snapshotStoreId(expected.key),
+            disposition: reconciledDisposition,
+            basis,
+            revision: snapshot.revision,
+            ...(validation.valid && validation.planDigest ? { planDigest: validation.planDigest } : {}),
+          };
+        } else {
+          currentContinuation = undefined;
+          reconciledDisposition = "unknown";
+        }
+      } else if (continuation || fields.status === "deleted") {
+        currentContinuation = undefined;
+      }
+
       widget.update();
-      let msg = `Updated task #${taskId} ${changedFields.join(", ")}`;
+      const changed = [...changedFields, ...(continuation ? ["continuation"] : [])];
+      let msg = `Updated task #${taskId} ${changed.join(", ")}`;
+      if (reconciledDisposition) msg += `; continuation ${reconciledDisposition}`;
       if (warnings.length > 0) {
         msg += ` (warning: ${warnings.join("; ")})`;
       }
